@@ -17,7 +17,6 @@
 @implementation AppDelegate (FirebasePlugin)
 
 static AppDelegate* instance;
-static id <UNUserNotificationCenterDelegate> _previousDelegate;
 
 + (AppDelegate*) instance {
     return instance;
@@ -72,12 +71,10 @@ static bool authStateChangeListenerInitialized = false;
             // Assume that another call (probably from another plugin) did so with the plist
             isFirebaseInitializedWithPlist = true;
         }
-    
-        // Set UNUserNotificationCenter delegate
-        if ([UNUserNotificationCenter currentNotificationCenter].delegate != nil) {
-            _previousDelegate = [UNUserNotificationCenter currentNotificationCenter].delegate;
-        }
-        [UNUserNotificationCenter currentNotificationCenter].delegate = self;
+
+		// Setting the notification center delegate unconditionally here (even when `FIREBASE_FCM_AUTOINIT_ENABLED`
+		// was `false`) was causing a conflict with `urbanairship-cordova` plug-in as it had its own delegate.
+        [self setUserNotificationCenterDelegateIfNeeded];
 
         // Set FCM messaging delegate
         [FIRMessaging messaging].delegate = self;
@@ -108,6 +105,49 @@ static bool authStateChangeListenerInitialized = false;
     return YES;
 }
 
+- (void)setUserNotificationCenterDelegateIfNeeded {
+	// We are going to use `FIRMessaging`'s `isAutoInitEnabled` property as the only flag controlling whether or not
+	// push notifications should be handled by our plug-in.
+	[self setUserNotificationCenterDelegateEnabled:[FIRMessaging messaging].isAutoInitEnabled];
+}
+
+static	__weak id <UNUserNotificationCenterDelegate> _prevUserNotificationCenterDelegate;
+static BOOL _isUserNotificationCenterDelegateEnabled;
+
+- (void)setUserNotificationCenterDelegateEnabled:(BOOL)enabled {
+
+	if (enabled) {
+	
+		if (_isUserNotificationCenterDelegateEnabled)
+			return;
+			
+		_prevUserNotificationCenterDelegate = [UNUserNotificationCenter currentNotificationCenter].delegate;
+		[UNUserNotificationCenter currentNotificationCenter].delegate = self;
+		_isUserNotificationCenterDelegateEnabled = YES;
+		
+	    [FirebasePlugin.firebasePlugin _logMessage:@"Enabled UNUserNotificationCenter's delegate"];
+	    
+	} else {
+	
+		if (!_isUserNotificationCenterDelegateEnabled)
+			return;
+			
+		if ([UNUserNotificationCenter currentNotificationCenter].delegate != self) {
+			[FirebasePlugin.firebasePlugin
+				_logError:@"Unable to disable UNUserNotificationCenter's delegate as it was replaced in the meantime. "
+					@"Do you use more than one plug-in to handle push notifications?"
+			];
+			return;
+		}
+		
+		[UNUserNotificationCenter currentNotificationCenter].delegate = _prevUserNotificationCenterDelegate;
+		_prevUserNotificationCenterDelegate = nil;
+		_isUserNotificationCenterDelegateEnabled = NO;
+		
+	    [FirebasePlugin.firebasePlugin _logMessage:@"Disabled UNUserNotificationCenter's delegate"];
+	}
+}
+
 - (void)applicationDidBecomeActive:(UIApplication *)application {
     self.applicationInBackground = @(NO);
     [FirebasePlugin.firebasePlugin _logMessage:@"Enter foreground"];
@@ -130,6 +170,9 @@ static bool authStateChangeListenerInitialized = false;
 }
 
 - (void)application:(UIApplication *)application didRegisterForRemoteNotificationsWithDeviceToken:(NSData *)deviceToken {
+	if (!_isUserNotificationCenterDelegateEnabled) {
+		return;
+	}
     [FIRMessaging messaging].APNSToken = deviceToken;
     [FirebasePlugin.firebasePlugin _logMessage:[NSString stringWithFormat:@"didRegisterForRemoteNotificationsWithDeviceToken: %@", deviceToken]];
     [FirebasePlugin.firebasePlugin sendApnsToken:[FirebasePlugin.firebasePlugin hexadecimalStringFromData:deviceToken]];
@@ -138,7 +181,11 @@ static bool authStateChangeListenerInitialized = false;
 //Tells the app that a remote notification arrived that indicates there is data to be fetched.
 // Called when a message arrives in the foreground and remote notifications permission has been granted
 - (void)application:(UIApplication *)application didReceiveRemoteNotification:(NSDictionary *)userInfo
-fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
+    fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
+
+	if (!_isUserNotificationCenterDelegateEnabled) {
+		return;
+	}
     
     @try{
         [[FIRMessaging messaging] appDidReceiveMessage:userInfo];
@@ -290,6 +337,9 @@ fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
 }
 
 - (void)application:(UIApplication *)application didFailToRegisterForRemoteNotificationsWithError:(NSError *)error {
+	if (!_isUserNotificationCenterDelegateEnabled) {
+		return;
+	}
     [FirebasePlugin.firebasePlugin _logError:[NSString stringWithFormat:@"didFailToRegisterForRemoteNotificationsWithError: %@", error.description]];
 }
 
@@ -311,12 +361,14 @@ fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
     
     @try{
 
-        if (![notification.request.trigger isKindOfClass:UNPushNotificationTrigger.class] && ![notification.request.trigger isKindOfClass:UNTimeIntervalNotificationTrigger.class]){
-            if (_previousDelegate) {
+        if (![notification.request.trigger isKindOfClass:UNPushNotificationTrigger.class] && ![notification.request.trigger isKindOfClass:UNTimeIntervalNotificationTrigger.class]) {
+            if (_prevUserNotificationCenterDelegate) {
                 // bubbling notification
-                [_previousDelegate userNotificationCenter:center
-                          willPresentNotification:notification
-                            withCompletionHandler:completionHandler];
+                [_prevUserNotificationCenterDelegate
+                	userNotificationCenter:center
+					willPresentNotification:notification
+					withCompletionHandler:completionHandler
+				];
                 return;
             } else {
                 [FirebasePlugin.firebasePlugin _logError:@"willPresentNotification: aborting as not a supported UNNotificationTrigger"];
@@ -387,10 +439,10 @@ fetchCompletionHandler:(void (^)(UIBackgroundFetchResult))completionHandler {
 {
     @try{
         
-        if (![response.notification.request.trigger isKindOfClass:UNPushNotificationTrigger.class] && ![response.notification.request.trigger isKindOfClass:UNTimeIntervalNotificationTrigger.class]){
-            if (_previousDelegate) {
+        if (![response.notification.request.trigger isKindOfClass:UNPushNotificationTrigger.class] && ![response.notification.request.trigger isKindOfClass:UNTimeIntervalNotificationTrigger.class]) {
+            if (_prevUserNotificationCenterDelegate) {
                 // bubbling event
-                [_previousDelegate userNotificationCenter:center
+                [_prevUserNotificationCenterDelegate userNotificationCenter:center
                                didReceiveNotificationResponse:response
                             withCompletionHandler:completionHandler];
                 return;
